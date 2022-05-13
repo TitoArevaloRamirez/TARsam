@@ -1,0 +1,9 @@
+<launch>
+    <arg name="project" default="tar_sam"/>
+    
+    <!-- 
+    <node pkg="$(arg project)" type="$(arg project)_projectDeskew" name="$(arg project)_projectDeskew" output="screen" respawn="true"/>
+    -->
+    <node pkg="$(arg project)" type="$(arg project)_featureExtraction" name="$(arg project)_featureExtraction" output="screen" respawn="true"/>
+    <node pkg="$(arg project)" type="$(arg project)_fastOdomGraph" name="$(arg project)_fastOdomGraph" output="screen" respawn="true"/>
+</launch>

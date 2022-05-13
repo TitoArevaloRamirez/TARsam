@@ -1,0 +1,19 @@
+<launch>
+	<arg name="project" default="tar_sam"/>
+    <!-- static_transform_publisher x y z qx qy qz qw frame_id child_frame_id-->
+    <!-- static_transform_publisher x y z yaw pitch roll frame_id child_frame_id -->
+
+    <!--payload frame_id to base frame_id -->
+    <node pkg="tf2_ros" type="static_transform_publisher" name="base_joint" args="0 0 0 0 0 0 1 base_link payload_link" />
+
+    <!--IMU frame_id to payload frame_id -->
+    <node pkg="tf2_ros" type="static_transform_publisher" name="imu_joint" args="0 0 0 0 0 0 1 payload_link imu_link" />
+
+    <!--GPS frame_id to payload frame_id -->
+    <node pkg="tf2_ros" type="static_transform_publisher" name="gps_joint" args="0 0 0 0 0 0 1 payload_link gps_link" />
+
+
+    <!--velodyne frame_id to payload frame_id -->
+    <node pkg="tf2_ros" type="static_transform_publisher" name="velodyne_joint" args="0 0 0 0 0 0 1 payload_link velodyne" />
+  
+</launch>

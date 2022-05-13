@@ -1,0 +1,22 @@
+tar_sam:
+  #--->Topics
+  pointCloudTopic: "velodyne_points"
+
+  #--->Frames
+  lidarFrame: velodyne
+  odomFrame: odom
+
+
+  #--->Sensor Settings
+  sensor: velodyne                            #Lidar sensor type: velodyne 
+  N_SCAN: 16                                  #Number of lidar scans: 16 
+  SCAN_Period: 0.1                            #Scan period 
+  Horizon_SCAN: 1800                          #Lidar horizontal resolution: 1800
+  lidarMinRange: 0.1                          #Minimum lidar range to be used
+  lidarMaxRange: 1000.0                       #Maximum lidar range to be used
+
+  #--->Fast Odometry Graph
+    #LiDAR Odometry
+  DISTANCE_SQ_THRESHOLD: 25
+  NEARBY_SCANEARBY_SCAN: 2.5
+  skipFrameNum: 5
