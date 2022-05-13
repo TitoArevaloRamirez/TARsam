@@ -8,6 +8,26 @@
 
 #include "lidarFactor.hpp"
 
+#include <gtsam/geometry/Rot3.h>
+#include <gtsam/geometry/Pose3.h>
+#include <gtsam/slam/PriorFactor.h>
+#include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/navigation/GPSFactor.h>
+#include <gtsam/navigation/ImuFactor.h>
+#include <gtsam/navigation/CombinedImuFactor.h>
+#include <gtsam/nonlinear/NonlinearFactorGraph.h>
+#include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
+#include <gtsam/nonlinear/Marginals.h>
+#include <gtsam/nonlinear/Values.h>
+#include <gtsam/inference/Symbol.h>
+
+#include <gtsam/nonlinear/ISAM2.h>
+#include <gtsam_unstable/nonlinear/IncrementalFixedLagSmoother.h>
+
+using gtsam::symbol_shorthand::X; // Pose3 (x,y,z,r,p,y)
+using gtsam::symbol_shorthand::V; // Vel   (xdot,ydot,zdot)
+using gtsam::symbol_shorthand::B; // Bias  (ax,ay,az,gx,gy,gz)
+
 using namespace message_filters;
 
 
@@ -19,16 +39,17 @@ class FastOdomGraph: public Params{
         message_filters::Subscriber<sensor_msgs::PointCloud2> cloud2;
         message_filters::Subscriber<sensor_msgs::PointCloud2> cloud3;
         message_filters::Subscriber<sensor_msgs::PointCloud2> cloud4;
-
         typedef sync_policies::ApproximateTime<sensor_msgs::PointCloud2, sensor_msgs::PointCloud2, sensor_msgs::PointCloud2, sensor_msgs::PointCloud2> MySyncPolicy;
-
         typedef Synchronizer<MySyncPolicy> Sync;
         boost::shared_ptr<Sync> sync;
+
+        ros::Subscriber subImu;
 
         ros::Publisher pub_cloudCornerLast;
         ros::Publisher pub_cloudSurfLast;
         ros::Publisher pub_fastOdom;
         ros::Publisher pub_fastOdom_path;
+        ros::Publisher pub_ImuOdometry;
 
         //Point cloud containers
         pcl::PointCloud<PointType>::Ptr cornerPointsSharp;
@@ -50,6 +71,8 @@ class FastOdomGraph: public Params{
         //queue<sensor_msgs::PointCloud2ConstPtr> surfFlatBuf;
         //queue<sensor_msgs::PointCloud2ConstPtr> surfLessFlatBuf;
         //queue<sensor_msgs::PointCloud2ConstPtr> fullPointsBuf;
+        std::deque<sensor_msgs::Imu> imuQueOpt;
+        std::deque<sensor_msgs::Imu> imuQueImu;
         
         //General variables
         int corner_correspondence;
@@ -59,6 +82,8 @@ class FastOdomGraph: public Params{
         double syncTime;
 
         int frameCount;
+
+        const double delta_t = 0;
 
         nav_msgs::Path laserPath;
 
@@ -72,6 +97,37 @@ class FastOdomGraph: public Params{
         Eigen::Map<Eigen::Quaterniond> q_last_curr;
         Eigen::Map<Eigen::Vector3d> t_last_curr;
 
+        // T_bl: tramsform points from lidar frame to imu frame 
+        gtsam::Pose3 imu2Lidar = gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0), gtsam::Point3(-extTrans.x(), -extTrans.y(), -extTrans.z()));
+        // T_lb: tramsform points from imu frame to lidar frame
+        gtsam::Pose3 lidar2Imu = gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0), gtsam::Point3(extTrans.x(), extTrans.y(), extTrans.z()));
+
+        //GTSAM models
+        gtsam::noiseModel::Diagonal::shared_ptr priorPoseNoise;
+        gtsam::noiseModel::Diagonal::shared_ptr priorVelNoise;
+        gtsam::noiseModel::Diagonal::shared_ptr priorBiasNoise;
+        gtsam::noiseModel::Diagonal::shared_ptr correctionNoise;
+        gtsam::noiseModel::Diagonal::shared_ptr correctionNoise2;
+        gtsam::Vector noiseModelBetweenBias;
+
+        gtsam::PreintegratedImuMeasurements *imuIntegratorOpt_;
+        gtsam::PreintegratedImuMeasurements *imuIntegratorImu_;
+
+        gtsam::Pose3 prevPose_;
+        gtsam::Vector3 prevVel_;
+        gtsam::NavState prevState_;
+        gtsam::imuBias::ConstantBias prevBias_;
+
+        gtsam::NavState prevStateOdom;
+        gtsam::imuBias::ConstantBias prevBiasOdom;
+
+
+        gtsam::ISAM2 optimizer;
+        gtsam::NonlinearFactorGraph graphFactors;
+        gtsam::Values graphValues;
+
+        int key = 1;
+
 
         //mutex
         std::mutex mtx;
@@ -79,6 +135,10 @@ class FastOdomGraph: public Params{
         //Flags
         bool systemInited; 
         bool firstLaserFrame; 
+
+        bool doneFirstOpt = false;
+        double lastImuT_imu = -1;
+        double lastImuT_opt = -1;
 
         FastOdomGraph():kdtreeCornerLast(new pcl::KdTreeFLANN<pcl::PointXYZI>()), kdtreeSurfLast(new pcl::KdTreeFLANN<pcl::PointXYZI>()), corner_correspondence(0), plane_correspondence(0), laserCloudCornerLastNum(0), laserCloudSurfLastNum(0), q_w_curr(1, 0, 0, 0), t_w_curr(0, 0, 0), q_last_curr(para_q), t_last_curr(para_t) {
 
@@ -93,11 +153,14 @@ class FastOdomGraph: public Params{
             cloud4.subscribe(nh, "tar_sam/feature/cloudLessFlat", 1);
             sync.reset(new Sync(MySyncPolicy(10), cloud1, cloud2, cloud3, cloud4));
             sync->registerCallback(boost::bind(&FastOdomGraph::featuresHandler, this, _1, _2, _3, _4));
+
+            subImu = nh.subscribe<sensor_msgs::Imu>  (imuTopic, 2000, &FastOdomGraph::imuHandler, this, ros::TransportHints().tcpNoDelay());
             
             pub_cloudCornerLast = nh.advertise<sensor_msgs::PointCloud2> ("tar_sam/features/cornerLast", 1);
             pub_cloudSurfLast = nh.advertise<sensor_msgs::PointCloud2> ("tar_sam/features/surfLast", 1);
             pub_fastOdom = nh.advertise<nav_msgs::Odometry> ("tar_sam/fastOdom", 1);
             pub_fastOdom_path = nh.advertise<nav_msgs::Path> ("tar_sam/fastOdom_path", 1);
+            pub_ImuOdometry = nh.advertise<nav_msgs::Odometry> ("tar_sam/ImuOdom", 2000);
 
             para_q[0] = 0.0;
             para_q[1] = 0.0;
@@ -110,16 +173,32 @@ class FastOdomGraph: public Params{
 
             frameCount = 0;
             
-            //q_last_curr = new Eigen::Map<Eigen::Quaterniond>(para_q);
-            //t_last_curr = new Eigen::Map<Eigen::Vector3d>(para_t);
-            //
             syncTime = 0.0;
 
             systemInited = false;
             firstLaserFrame = false;
 
+            setupFactorGraph();
             allocateMemory();
-            resetParameters();
+            resetClouds();
+        }
+
+        void setupFactorGraph(){
+            boost::shared_ptr<gtsam::PreintegrationParams> p = gtsam::PreintegrationParams::MakeSharedU(imuGravity);
+            p->accelerometerCovariance  = gtsam::Matrix33::Identity(3,3) * pow(imuAccNoise, 2); // acc white noise in continuous
+            p->gyroscopeCovariance      = gtsam::Matrix33::Identity(3,3) * pow(imuGyrNoise, 2); // gyro white noise in continuous
+            p->integrationCovariance    = gtsam::Matrix33::Identity(3,3) * pow(1e-4, 2); // error committed in integrating position from velocities
+            gtsam::imuBias::ConstantBias prior_imu_bias((gtsam::Vector(6) << 0, 0, 0, 0, 0, 0).finished());; // assume zero initial bias
+
+            priorPoseNoise  = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-2, 1e-2, 1e-2, 1e-2, 1e-2, 1e-2).finished()); // rad,rad,rad,m, m, m
+            priorVelNoise   = gtsam::noiseModel::Isotropic::Sigma(3, 1e4); // m/s
+            priorBiasNoise  = gtsam::noiseModel::Isotropic::Sigma(6, 1e-3); // 1e-2 ~ 1e-3 seems to be good
+            correctionNoise = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 0.05, 0.05, 0.05, 0.1, 0.1, 0.1).finished()); // rad,rad,rad,m, m, m
+            correctionNoise2 = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1, 1, 1, 1, 1, 1).finished()); // rad,rad,rad,m, m, m
+            noiseModelBetweenBias = (gtsam::Vector(6) << imuAccBiasN, imuAccBiasN, imuAccBiasN, imuGyrBiasN, imuGyrBiasN, imuGyrBiasN).finished();
+            
+            imuIntegratorImu_ = new gtsam::PreintegratedImuMeasurements(p, prior_imu_bias); // setting up the IMU integration for IMU message thread
+            imuIntegratorOpt_ = new gtsam::PreintegratedImuMeasurements(p, prior_imu_bias); // setting up the IMU integration for optimization        
         }
 
         void allocateMemory(){
@@ -137,7 +216,7 @@ class FastOdomGraph: public Params{
 
         }
 
-        void resetParameters(){
+        void resetClouds(){
             cornerPointsSharp->clear();
             cornerPointsLessSharp->clear();
             surfPointsFlat->clear();
@@ -146,6 +225,25 @@ class FastOdomGraph: public Params{
             //laserCloudCornerLast->clear();
             //laserCloudSurfLast->clear();
             //laserCloudFullRes->clear();
+        }
+
+        void resetOptimization(){
+            gtsam::ISAM2Params optParameters;
+            optParameters.relinearizeThreshold = 0.1;
+            optParameters.relinearizeSkip = 1;
+            optimizer = gtsam::ISAM2(optParameters);
+
+            gtsam::NonlinearFactorGraph newGraphFactors;
+            graphFactors = newGraphFactors;
+
+            gtsam::Values NewGraphValues;
+            graphValues = NewGraphValues;
+        }
+
+        void resetGraphParams(){
+            lastImuT_imu = -1;
+            doneFirstOpt = false;
+            systemInited = false;
         }
 
         void featuresHandler(const sensor_msgs::PointCloud2ConstPtr &cloudSharp_msg, const sensor_msgs::PointCloud2ConstPtr &cloudLessSharp_msg, const sensor_msgs::PointCloud2ConstPtr &cloudFlat_msg, const sensor_msgs::PointCloud2ConstPtr &cloudLessFlat_msg){
@@ -158,6 +256,10 @@ class FastOdomGraph: public Params{
             //mtx_buffer.unlock();
             //
             syncTime = cloudFlat_msg->header.stamp.toSec();
+
+            // make sure we have imu data to integrate
+            if (imuQueOpt.empty())
+                return;
             
             //Get feature clouds
             pcl::fromROSMsg(*cloudSharp_msg, *cornerPointsSharp); 
@@ -166,15 +268,185 @@ class FastOdomGraph: public Params{
             pcl::fromROSMsg(*cloudLessFlat_msg, *surfPointsLessFlat); 
 
             if (!systemInited){
+                resetOptimization();
+
+                // initial Pose
+                gtsam::Pose3 initialPose = gtsam::Pose3(gtsam::Rot3::Quaternion(1, 0, 0, 0), gtsam::Point3(0, 0, 0));
+                prevPose_ = initialPose.compose(lidar2Imu);
+                gtsam::PriorFactor<gtsam::Pose3> priorPose(X(0), prevPose_, priorPoseNoise);
+                graphFactors.add(priorPose);
+
+                // initial velocity
+                prevVel_ = gtsam::Vector3(0, 0, 0);
+                gtsam::PriorFactor<gtsam::Vector3> priorVel(V(0), prevVel_, priorVelNoise);
+                graphFactors.add(priorVel);
+
+                // initial bias
+                prevBias_ = gtsam::imuBias::ConstantBias();
+                gtsam::PriorFactor<gtsam::imuBias::ConstantBias> priorBias(B(0), prevBias_, priorBiasNoise);
+                graphFactors.add(priorBias);
+
+                // add values
+                graphValues.insert(X(0), prevPose_);
+                graphValues.insert(V(0), prevVel_);
+                graphValues.insert(B(0), prevBias_);
+
+                // optimize once
+                optimizer.update(graphFactors, graphValues);
+                graphFactors.resize(0);
+                graphValues.clear();
+
+                imuIntegratorImu_->resetIntegrationAndSetBias(prevBias_);
+                imuIntegratorOpt_->resetIntegrationAndSetBias(prevBias_);
+                
+                key = 1;
                 systemInited = true;
                 ROS_INFO("\033[1;32m Fast Odometry Initialized \033[0m");
+                updateLaserFeatures();
+                return;
             }
-            else{
 
-                computeLaserOdom();
+            resetGraph4Speed();
+
+            computeLaserOdom();
+            updateLaserFeatures();
+            resetClouds();
+
+            integrateIMUData();
+
+            // add imu factor to graph
+            const gtsam::PreintegratedImuMeasurements& preint_imu = dynamic_cast<const gtsam::PreintegratedImuMeasurements&>(*imuIntegratorOpt_);
+            gtsam::ImuFactor imu_factor(X(key - 1), V(key - 1), X(key), V(key), B(key - 1), preint_imu);
+            graphFactors.add(imu_factor);
+
+            // add imu bias between factor
+            graphFactors.add(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(B(key - 1), B(key), gtsam::imuBias::ConstantBias(),
+                             gtsam::noiseModel::Diagonal::Sigmas(sqrt(imuIntegratorOpt_->deltaTij()) * noiseModelBetweenBias)));
+
+            // add LiDAR factor
+            gtsam::Pose3 lidarPose = gtsam::Pose3(gtsam::Rot3::Quaternion(q_last_curr.w(), q_last_curr.x(), q_last_curr.y(), q_last_curr.z()), gtsam::Point3(t_last_curr.x(), t_last_curr.y(), t_last_curr.z()));
+            gtsam::Pose3 curPose = lidarPose.compose(lidar2Imu);
+            gtsam::BetweenFactor<gtsam::Pose3> pose_factor(X(key-1), X(key), curPose, correctionNoise);
+            graphFactors.add(pose_factor);
+
+            // insert predicted values
+            gtsam::NavState propState_ = imuIntegratorOpt_->predict(prevState_, prevBias_);
+            graphValues.insert(X(key), propState_.pose());
+            graphValues.insert(V(key), propState_.v());
+            graphValues.insert(B(key), prevBias_);
+
+            // optimize
+            optimizer.update(graphFactors, graphValues);
+            optimizer.update();
+            graphFactors.resize(0);
+            graphValues.clear();
+            
+            // Overwrite the beginning of the preintegration for the next step.
+            gtsam::Values result = optimizer.calculateEstimate();
+            prevPose_  = result.at<gtsam::Pose3>(X(key));
+            prevVel_   = result.at<gtsam::Vector3>(V(key));
+            prevState_ = gtsam::NavState(prevPose_, prevVel_);
+            prevBias_  = result.at<gtsam::imuBias::ConstantBias>(B(key));
+
+            t_w_curr.x() = prevPose_.translation().x();
+            t_w_curr.y() = prevPose_.translation().y();
+            t_w_curr.z() = prevPose_.translation().z();
+
+            q_w_curr.w() = prevPose_.rotation().toQuaternion().w();
+            q_w_curr.x() = prevPose_.rotation().toQuaternion().x();
+            q_w_curr.y() = prevPose_.rotation().toQuaternion().y();
+            q_w_curr.z() = prevPose_.rotation().toQuaternion().z();
+
+            // Reset the optimization preintegration object.
+            imuIntegratorOpt_->resetIntegrationAndSetBias(prevBias_);
+
+            // 2. after optiization, re-propagate imu odometry preintegration
+            prevStateOdom = prevState_;
+            prevBiasOdom  = prevBias_;
+            // first pop imu message older than current correction data
+            double lastImuQT = -1;
+            while (!imuQueImu.empty() && ROS_TIME(&imuQueImu.front()) < syncTime - delta_t)
+            {
+                lastImuQT = ROS_TIME(&imuQueImu.front());
+                imuQueImu.pop_front();
             }
+            // repropogate
+            if (!imuQueImu.empty())
+            {
+                // reset bias use the newly optimized bias
+                imuIntegratorImu_->resetIntegrationAndSetBias(prevBiasOdom);
+                // integrate imu message from the beginning of this optimization
+                for (int i = 0; i < (int)imuQueImu.size(); ++i)
+                {
+                    sensor_msgs::Imu *thisImu = &imuQueImu[i];
+                    double imuTime = ROS_TIME(thisImu);
+                    double dt = (lastImuQT < 0) ? (1.0 / 500.0) :(imuTime - lastImuQT);
+
+                    imuIntegratorImu_->integrateMeasurement(gtsam::Vector3(thisImu->linear_acceleration.x, thisImu->linear_acceleration.y, thisImu->linear_acceleration.z),
+                                                            gtsam::Vector3(thisImu->angular_velocity.x,    thisImu->angular_velocity.y,    thisImu->angular_velocity.z), dt);
+                    lastImuQT = imuTime;
+                }
+            }
+
+            ++key;
+            doneFirstOpt = true;
+
             publishLaserOdom();
 
+            //frameCount++;
+        }
+        void resetGraph4Speed(){
+            if (key == 100){
+                // get updated noise before reset
+                gtsam::noiseModel::Gaussian::shared_ptr updatedPoseNoise = gtsam::noiseModel::Gaussian::Covariance(optimizer.marginalCovariance(X(key-1)));
+                gtsam::noiseModel::Gaussian::shared_ptr updatedVelNoise  = gtsam::noiseModel::Gaussian::Covariance(optimizer.marginalCovariance(V(key-1)));
+                gtsam::noiseModel::Gaussian::shared_ptr updatedBiasNoise = gtsam::noiseModel::Gaussian::Covariance(optimizer.marginalCovariance(B(key-1)));
+                // reset graph
+                resetOptimization();
+                // add pose
+                gtsam::PriorFactor<gtsam::Pose3> priorPose(X(0), prevPose_, updatedPoseNoise);
+                graphFactors.add(priorPose);
+                // add velocity
+                gtsam::PriorFactor<gtsam::Vector3> priorVel(V(0), prevVel_, updatedVelNoise);
+                graphFactors.add(priorVel);
+                // add bias
+                gtsam::PriorFactor<gtsam::imuBias::ConstantBias> priorBias(B(0), prevBias_, updatedBiasNoise);
+                graphFactors.add(priorBias);
+                // add values
+                graphValues.insert(X(0), prevPose_);
+                graphValues.insert(V(0), prevVel_);
+                graphValues.insert(B(0), prevBias_);
+                // optimize once
+                optimizer.update(graphFactors, graphValues);
+                graphFactors.resize(0);
+                graphValues.clear();
+
+                key = 1;
+            }
+
+        }
+        void integrateIMUData(){
+            while (!imuQueOpt.empty()){
+                // pop and integrate imu data that is between two optimizations
+                sensor_msgs::Imu *thisImu = &imuQueOpt.front();
+                double imuTime = ROS_TIME(thisImu);
+                if (imuTime < syncTime - delta_t)
+                {
+                    double dt = (lastImuT_opt < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_opt);
+                    imuIntegratorOpt_->integrateMeasurement(
+                            gtsam::Vector3(thisImu->linear_acceleration.x, thisImu->linear_acceleration.y, thisImu->linear_acceleration.z),
+                            gtsam::Vector3(thisImu->angular_velocity.x,    thisImu->angular_velocity.y,    thisImu->angular_velocity.z), dt);
+                    
+                    lastImuT_opt = imuTime;
+                    imuQueOpt.pop_front();
+                }
+                else
+                    break;
+            }
+
+        }
+
+        void updateLaserFeatures(){
             pcl::PointCloud<PointType>::Ptr laserCloudTemp = cornerPointsLessSharp;
             cornerPointsLessSharp = laserCloudCornerLast;
             laserCloudCornerLast = laserCloudTemp;
@@ -189,9 +461,6 @@ class FastOdomGraph: public Params{
             kdtreeCornerLast->setInputCloud(laserCloudCornerLast);
             kdtreeSurfLast->setInputCloud(laserCloudSurfLast);
 
-            resetParameters();
-
-            frameCount++;
         }
 
         void publishLaserOdom(){
@@ -199,13 +468,13 @@ class FastOdomGraph: public Params{
             laserOdometry.header.frame_id = odomFrame;
             laserOdometry.child_frame_id = "/laser_odom";
             laserOdometry.header.stamp = ros::Time().fromSec(syncTime);
-            laserOdometry.pose.pose.orientation.x = q_last_curr.x();
-            laserOdometry.pose.pose.orientation.y = q_last_curr.y();
-            laserOdometry.pose.pose.orientation.z = q_last_curr.z();
-            laserOdometry.pose.pose.orientation.w = q_last_curr.w();
-            laserOdometry.pose.pose.position.x = t_last_curr.x();
-            laserOdometry.pose.pose.position.y = t_last_curr.y();
-            laserOdometry.pose.pose.position.z = t_last_curr.z();
+            laserOdometry.pose.pose.orientation.x = q_w_curr.x();
+            laserOdometry.pose.pose.orientation.y = q_w_curr.y();
+            laserOdometry.pose.pose.orientation.z = q_w_curr.z();
+            laserOdometry.pose.pose.orientation.w = q_w_curr.w();
+            laserOdometry.pose.pose.position.x = t_w_curr.x();
+            laserOdometry.pose.pose.position.y = t_w_curr.y();
+            laserOdometry.pose.pose.position.z = t_w_curr.z();
             pub_fastOdom.publish(laserOdometry);
 
             geometry_msgs::PoseStamped laserPose;
@@ -411,8 +680,8 @@ class FastOdomGraph: public Params{
 
             }
 
-            t_w_curr = t_w_curr + q_w_curr * t_last_curr;
-            q_w_curr = q_w_curr * q_last_curr;
+            //t_w_curr = t_w_curr + q_w_curr * t_last_curr;
+            //q_w_curr = q_w_curr * q_last_curr;
 
         }
 
@@ -435,6 +704,54 @@ class FastOdomGraph: public Params{
             po->intensity = pi->intensity;
         }
 
+        void imuHandler(const sensor_msgs::Imu::ConstPtr& imu_raw){
+            std::lock_guard<std::mutex> lock(mtx);
+
+            sensor_msgs::Imu thisImu = imuConverter(*imu_raw);
+
+            imuQueOpt.push_back(thisImu);
+            imuQueImu.push_back(thisImu);
+
+            if (doneFirstOpt == false)
+                return;
+
+            double imuTime = ROS_TIME(&thisImu);
+            double dt = (lastImuT_imu < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_imu);
+            lastImuT_imu = imuTime;
+
+            // integrate this single imu message
+            imuIntegratorImu_->integrateMeasurement(gtsam::Vector3(thisImu.linear_acceleration.x, thisImu.linear_acceleration.y, thisImu.linear_acceleration.z),
+                                                    gtsam::Vector3(thisImu.angular_velocity.x,    thisImu.angular_velocity.y,    thisImu.angular_velocity.z), dt);
+
+            // predict odometry
+            gtsam::NavState currentState = imuIntegratorImu_->predict(prevStateOdom, prevBiasOdom);
+
+            // publish odometry
+            nav_msgs::Odometry odometry;
+            odometry.header.stamp = thisImu.header.stamp;
+            odometry.header.frame_id = odomFrame;
+            odometry.child_frame_id = "odom_imu";
+
+            // transform imu pose to ldiar
+            gtsam::Pose3 imuPose = gtsam::Pose3(currentState.quaternion(), currentState.position());
+            gtsam::Pose3 lidarPose = imuPose.compose(imu2Lidar);
+
+            odometry.pose.pose.position.x = lidarPose.translation().x();
+            odometry.pose.pose.position.y = lidarPose.translation().y();
+            odometry.pose.pose.position.z = lidarPose.translation().z();
+            odometry.pose.pose.orientation.x = lidarPose.rotation().toQuaternion().x();
+            odometry.pose.pose.orientation.y = lidarPose.rotation().toQuaternion().y();
+            odometry.pose.pose.orientation.z = lidarPose.rotation().toQuaternion().z();
+            odometry.pose.pose.orientation.w = lidarPose.rotation().toQuaternion().w();
+            
+            odometry.twist.twist.linear.x = currentState.velocity().x();
+            odometry.twist.twist.linear.y = currentState.velocity().y();
+            odometry.twist.twist.linear.z = currentState.velocity().z();
+            odometry.twist.twist.angular.x = thisImu.angular_velocity.x + prevBiasOdom.gyroscope().x();
+            odometry.twist.twist.angular.y = thisImu.angular_velocity.y + prevBiasOdom.gyroscope().y();
+            odometry.twist.twist.angular.z = thisImu.angular_velocity.z + prevBiasOdom.gyroscope().z();
+            pub_ImuOdometry.publish(odometry);
+        }
 
 
 };

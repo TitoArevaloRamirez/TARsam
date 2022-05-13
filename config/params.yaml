@@ -1,6 +1,7 @@
 tar_sam:
   #--->Topics
   pointCloudTopic: "velodyne_points"
+  imuTopic: "/xsens/imu/data"
 
   #--->Frames
   lidarFrame: velodyne
@@ -14,6 +15,29 @@ tar_sam:
   Horizon_SCAN: 1800                          #Lidar horizontal resolution: 1800
   lidarMinRange: 0.1                          #Minimum lidar range to be used
   lidarMaxRange: 1000.0                       #Maximum lidar range to be used
+   
+  #---> IMU Settings
+  imuAccNoise: 3.9939570888238808e-03
+  imuGyrNoise: 1.5636343949698187e-03
+  imuAccBiasN: 6.4356659353532566e-05
+  imuGyrBiasN: 3.5640318696367613e-05
+  imuGravity: 9.80511
+  imuRPYWeight: 0.01
+
+  # Extrinsics: T_lb (lidar -> imu)
+  extrinsicTrans: [0.0, 0.0, 0.0]
+  extrinsicRot: [1, 0, 0,
+                  0, -1, 0,
+                  0, 0, -1]
+  extrinsicRPY: [1, 0, 0,
+                 0, -1, 0,
+                 0, 0, -1]
+  # extrinsicRot: [1, 0, 0,
+  #                 0, 1, 0,
+  #                 0, 0, 1]
+  # extrinsicRPY: [1, 0, 0,
+  #                 0, 1, 0,
+  #                 0, 0, 1]
 
   #--->Fast Odometry Graph
     #LiDAR Odometry
