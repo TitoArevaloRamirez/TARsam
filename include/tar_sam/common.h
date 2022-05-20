@@ -29,6 +29,9 @@
 #include <sensor_msgs/NavSatFix.h>
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
+#include <visualization_msgs/Marker.h>
+#include <visualization_msgs/MarkerArray.h>
+#include <std_msgs/Float64MultiArray.h>
 
 
 /********** PCL **********/
@@ -45,6 +48,12 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/crop_box.h> 
 #include <pcl_conversions/pcl_conversions.h>
+
+/********** tf **********/
+#include <tf/LinearMath/Quaternion.h>
+#include <tf/transform_listener.h>
+#include <tf/transform_datatypes.h>
+#include <tf/transform_broadcaster.h>
 
 /********** OpenCV **********/
 #include <opencv2/opencv.hpp>
@@ -75,6 +84,7 @@ class Params{
         //Topics
         string ptCloudTopic;
         string imuTopic;
+        string gpsTopic;
         
         //LiDAR Setup
         SensorType sensor;
@@ -100,18 +110,60 @@ class Params{
         Eigen::Quaterniond extQRPY;
 
         //Frames
+        string baselinkFrame;
         string lidarFrame;
         string odomFrame;
+        string mapFrame;
 
         //Fast Odometry Graph
         float DISTANCE_SQ_THRESHOLD;
         float NEARBY_SCAN;
         int skipFrameNum;
 
+        //Map Optimization
+        bool useImuHeadingInitialization;
+        bool useGpsElevation;
+        float gpsCovThreshold;
+        float poseCovThreshold;
+
+        bool savePCD;
+        string savePCDDirectory;
+
+        int edgeFeatureMinValidNum;
+        int surfFeatureMinValidNum;
+
+        float odometrySurfLeafSize;
+        float mappingCornerLeafSize;
+        float mappingSurfLeafSize ;
+
+        float z_tollerance; 
+        float rotation_tollerance;
+
+        int numberOfCores;
+        double mappingProcessInterval;
+
+        float surroundingkeyframeAddingDistThreshold; 
+        float surroundingkeyframeAddingAngleThreshold; 
+        float surroundingKeyframeDensity;
+        float surroundingKeyframeSearchRadius;
+        
+        bool  loopClosureEnableFlag;
+        float loopClosureFrequency;
+        int   surroundingKeyframeSize;
+        float historyKeyframeSearchRadius;
+        float historyKeyframeSearchTimeDiff;
+        int   historyKeyframeSearchNum;
+        float historyKeyframeFitnessScore;
+
+        float globalMapVisualizationSearchRadius;
+        float globalMapVisualizationPoseDensity;
+        float globalMapVisualizationLeafSize;
+
         Params(){
             //Topics
             nh.param<std::string>("tar_sam/ptCloudTopic", ptCloudTopic, "velodyne_points");
             nh.param<std::string>("tar_sam/imuTopic", imuTopic, "imu_fix");
+            nh.param<std::string>("lio_sam/gpsTopic", gpsTopic, "odometry/gps");
             
             //LiDAR Setup
             nh.param<int>("tar_sam/N_SCAN", N_SCAN, 16);
@@ -119,8 +171,12 @@ class Params{
             nh.param<int>("tar_sam/Horizon_SCAN", Horizon_SCAN, 1800);
             nh.param<float>("tar_sam/lidarMinRange", lidarMinRange, 1.0);
             nh.param<float>("tar_sam/lidarMaxRange", lidarMaxRange, 1000.0);
+
+            //Frames
+            nh.param<std::string>("tar_sam/baselinkFrame", baselinkFrame, "base_link");
             nh.param<std::string>("tar_sam/lidarFrame", lidarFrame, "velodyne");
             nh.param<std::string>("tar_sam/odomFrame", odomFrame, "odom");
+            nh.param<std::string>("tar_sam/mapFrame", mapFrame, "map");
 
             //IMU Setup
             nh.param<float>("tar_sam/imuAccNoise", imuAccNoise, 0.01);
@@ -141,6 +197,42 @@ class Params{
             nh.param<float>("tar_sam/DISTANCE_SQ_THRESHOLD", DISTANCE_SQ_THRESHOLD, 25.0);
             nh.param<float>("tar_sam/NEARBY_SCAN", NEARBY_SCAN, 2.5);
             nh.param<int>("tar_sam/skipFrameNum", skipFrameNum, 5);
+
+            //Map Optimization
+
+            nh.param<bool>("tar_sam/useImuHeadingInitialization", useImuHeadingInitialization, false);
+            nh.param<bool>("tar_sam/useGpsElevation", useGpsElevation, false);
+            nh.param<float>("tar_sam/gpsCovThreshold", gpsCovThreshold, 2.0);
+            nh.param<float>("tar_sam/poseCovThreshold", poseCovThreshold, 25.0);
+
+            nh.param<int>("tar_sam/edgeFeatureMinValidNum", edgeFeatureMinValidNum, 10);
+            nh.param<int>("tar_sam/surfFeatureMinValidNum", surfFeatureMinValidNum, 100);
+
+            nh.param<float>("tar_sam/mappingCornerLeafSize", mappingCornerLeafSize, 0.2);
+            nh.param<float>("tar_sam/mappingSurfLeafSize", mappingSurfLeafSize, 0.2);
+
+            nh.param<float>("tar_sam/z_tollerance", z_tollerance, FLT_MAX);
+            nh.param<float>("tar_sam/rotation_tollerance", rotation_tollerance, FLT_MAX);
+
+            nh.param<int>("tar_sam/numberOfCores", numberOfCores, 2);
+            nh.param<double>("tar_sam/mappingProcessInterval", mappingProcessInterval, 0.15);
+
+            nh.param<float>("tar_sam/surroundingkeyframeAddingDistThreshold", surroundingkeyframeAddingDistThreshold, 1.0);
+            nh.param<float>("tar_sam/surroundingkeyframeAddingAngleThreshold", surroundingkeyframeAddingAngleThreshold, 0.2);
+            nh.param<float>("tar_sam/surroundingKeyframeDensity", surroundingKeyframeDensity, 1.0);
+            nh.param<float>("tar_sam/surroundingKeyframeSearchRadius", surroundingKeyframeSearchRadius, 50.0);
+
+            nh.param<bool>("tar_sam/loopClosureEnableFlag", loopClosureEnableFlag, false);
+            nh.param<float>("tar_sam/loopClosureFrequency", loopClosureFrequency, 1.0);
+            nh.param<int>("tar_sam/surroundingKeyframeSize", surroundingKeyframeSize, 50);
+            nh.param<float>("tar_sam/historyKeyframeSearchRadius", historyKeyframeSearchRadius, 10.0);
+            nh.param<float>("tar_sam/historyKeyframeSearchTimeDiff", historyKeyframeSearchTimeDiff, 30.0);
+            nh.param<int>("tar_sam/historyKeyframeSearchNum", historyKeyframeSearchNum, 25);
+            nh.param<float>("tar_sam/historyKeyframeFitnessScore", historyKeyframeFitnessScore, 0.3);
+
+            nh.param<float>("tar_sam/globalMapVisualizationSearchRadius", globalMapVisualizationSearchRadius, 1e3);
+            nh.param<float>("tar_sam/globalMapVisualizationPoseDensity", globalMapVisualizationPoseDensity, 10.0);
+            nh.param<float>("tar_sam/globalMapVisualizationLeafSize", globalMapVisualizationLeafSize, 1.0);
         } 
 
 

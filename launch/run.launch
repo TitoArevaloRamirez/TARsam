@@ -15,7 +15,7 @@
 
 
     <!-- Run Rviz
-    <include file="$(find tar_sam)/launch/include/module_rviz.launch" />
     -->
+    <include file="$(find tar_sam)/launch/include/module_rviz.launch" />
 
 </launch>

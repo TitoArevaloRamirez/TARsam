@@ -1,6 +1,8 @@
 #include "tar_sam/common.h"
+#include "tar_sam/cloud_info.h"
 
 #include <boost/smart_ptr/shared_ptr.hpp>
+#include <gtsam/nonlinear/PriorFactor.h>
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/approximate_time.h>
@@ -39,17 +41,20 @@ class FastOdomGraph: public Params{
         message_filters::Subscriber<sensor_msgs::PointCloud2> cloud2;
         message_filters::Subscriber<sensor_msgs::PointCloud2> cloud3;
         message_filters::Subscriber<sensor_msgs::PointCloud2> cloud4;
-        typedef sync_policies::ApproximateTime<sensor_msgs::PointCloud2, sensor_msgs::PointCloud2, sensor_msgs::PointCloud2, sensor_msgs::PointCloud2> MySyncPolicy;
+        message_filters::Subscriber<sensor_msgs::PointCloud2> cloud5;
+        typedef sync_policies::ApproximateTime<sensor_msgs::PointCloud2, sensor_msgs::PointCloud2, sensor_msgs::PointCloud2, sensor_msgs::PointCloud2, sensor_msgs::PointCloud2> MySyncPolicy;
         typedef Synchronizer<MySyncPolicy> Sync;
         boost::shared_ptr<Sync> sync;
 
         ros::Subscriber subImu;
+        ros::Subscriber subOdometry;
 
         ros::Publisher pub_cloudCornerLast;
         ros::Publisher pub_cloudSurfLast;
         ros::Publisher pub_fastOdom;
         ros::Publisher pub_fastOdom_path;
         ros::Publisher pub_ImuOdometry;
+        ros::Publisher pubLaserCloudInfo;
 
         //Point cloud containers
         pcl::PointCloud<PointType>::Ptr cornerPointsSharp;
@@ -81,11 +86,16 @@ class FastOdomGraph: public Params{
         int laserCloudSurfLastNum;
         double syncTime;
 
+        double syncTime_arr[100];
+
         int frameCount;
 
         const double delta_t = 0;
 
         nav_msgs::Path laserPath;
+        tar_sam::cloud_info cloudInfo;
+        
+        std_msgs::Header cloudHeader;
 
         //Transformations
         Eigen::Quaterniond q_w_curr;
@@ -151,16 +161,19 @@ class FastOdomGraph: public Params{
             cloud2.subscribe(nh, "tar_sam/feature/cloudLessSharp", 1);
             cloud3.subscribe(nh, "tar_sam/feature/cloudFlat", 1);
             cloud4.subscribe(nh, "tar_sam/feature/cloudLessFlat", 1);
-            sync.reset(new Sync(MySyncPolicy(10), cloud1, cloud2, cloud3, cloud4));
-            sync->registerCallback(boost::bind(&FastOdomGraph::featuresHandler, this, _1, _2, _3, _4));
+            cloud5.subscribe(nh, "tar_sam/cloudDeskew", 1);
+            sync.reset(new Sync(MySyncPolicy(10), cloud1, cloud2, cloud3, cloud4, cloud5));
+            sync->registerCallback(boost::bind(&FastOdomGraph::featuresHandler, this, _1, _2, _3, _4, _5));
 
             subImu = nh.subscribe<sensor_msgs::Imu>  (imuTopic, 2000, &FastOdomGraph::imuHandler, this, ros::TransportHints().tcpNoDelay());
+            subOdometry = nh.subscribe<nav_msgs::Odometry>("tar_sam/mapping/odometry_incremental", 5,    &FastOdomGraph::odometryHandler, this, ros::TransportHints().tcpNoDelay());
             
             pub_cloudCornerLast = nh.advertise<sensor_msgs::PointCloud2> ("tar_sam/features/cornerLast", 1);
             pub_cloudSurfLast = nh.advertise<sensor_msgs::PointCloud2> ("tar_sam/features/surfLast", 1);
             pub_fastOdom = nh.advertise<nav_msgs::Odometry> ("tar_sam/fastOdom", 1);
             pub_fastOdom_path = nh.advertise<nav_msgs::Path> ("tar_sam/fastOdom_path", 1);
             pub_ImuOdometry = nh.advertise<nav_msgs::Odometry> ("tar_sam/ImuOdom", 2000);
+            pubLaserCloudInfo = nh.advertise<tar_sam::cloud_info> ("tar_sam/feature/cloud_info", 1);
 
             para_q[0] = 0.0;
             para_q[1] = 0.0;
@@ -246,7 +259,38 @@ class FastOdomGraph: public Params{
             systemInited = false;
         }
 
-        void featuresHandler(const sensor_msgs::PointCloud2ConstPtr &cloudSharp_msg, const sensor_msgs::PointCloud2ConstPtr &cloudLessSharp_msg, const sensor_msgs::PointCloud2ConstPtr &cloudFlat_msg, const sensor_msgs::PointCloud2ConstPtr &cloudLessFlat_msg){
+        void odometryHandler(const nav_msgs::Odometry::ConstPtr& odomMsg){
+            std::lock_guard<std::mutex> lock(mtx);
+
+            double currentCorrectionTime = ROS_TIME(odomMsg);
+
+            for (int i = 0; i < 99; i++){
+                if (currentCorrectionTime == syncTime_arr[i]){
+                    float p_x = odomMsg->pose.pose.position.x;
+                    float p_y = odomMsg->pose.pose.position.y;
+                    float p_z = odomMsg->pose.pose.position.z;
+                    float r_x = odomMsg->pose.pose.orientation.x;
+                    float r_y = odomMsg->pose.pose.orientation.y;
+                    float r_z = odomMsg->pose.pose.orientation.z;
+                    float r_w = odomMsg->pose.pose.orientation.w;
+                    bool degenerate = (int)odomMsg->pose.covariance[0] == 1 ? true : false;
+                    gtsam::Pose3 priorPose = gtsam::Pose3(gtsam::Rot3::Quaternion(r_w, r_x, r_y, r_z), gtsam::Point3(p_x, p_y, p_z));
+
+                    gtsam::Pose3 curPose = priorPose.compose(lidar2Imu);
+                    gtsam::PriorFactor<gtsam::Pose3> pose_factor_1(X(i), curPose, correctionNoise);
+                    graphFactors.add(pose_factor_1);
+                    ROS_INFO("correction");
+
+                    syncTime_arr[i] = 0;
+                    break;
+                }
+                syncTime_arr[i] = 0;
+            }
+
+        }
+
+
+        void featuresHandler(const sensor_msgs::PointCloud2ConstPtr &cloudSharp_msg, const sensor_msgs::PointCloud2ConstPtr &cloudLessSharp_msg, const sensor_msgs::PointCloud2ConstPtr &cloudFlat_msg, const sensor_msgs::PointCloud2ConstPtr &cloudLessFlat_msg, const sensor_msgs::PointCloud2ConstPtr &cloudDeskew_msg){
             std::lock_guard<std::mutex> lock(mtx);
             //mtx_buffer.lock();
             //cornerSharpBuf.push(cloudSharp_msg);
@@ -255,7 +299,9 @@ class FastOdomGraph: public Params{
             //surfLessFlatBuf.push(cloudLessFlat_msg);
             //mtx_buffer.unlock();
             //
+
             syncTime = cloudFlat_msg->header.stamp.toSec();
+            cloudHeader = cloudFlat_msg->header;            // new cloud header
 
             // make sure we have imu data to integrate
             if (imuQueOpt.empty())
@@ -266,6 +312,7 @@ class FastOdomGraph: public Params{
             pcl::fromROSMsg(*cloudLessSharp_msg, *cornerPointsLessSharp); 
             pcl::fromROSMsg(*cloudFlat_msg, *surfPointsFlat); 
             pcl::fromROSMsg(*cloudLessFlat_msg, *surfPointsLessFlat); 
+            cloudInfo.cloud_deskewed = *cloudDeskew_msg;
 
             if (!systemInited){
                 resetOptimization();
@@ -298,7 +345,9 @@ class FastOdomGraph: public Params{
 
                 imuIntegratorImu_->resetIntegrationAndSetBias(prevBias_);
                 imuIntegratorOpt_->resetIntegrationAndSetBias(prevBias_);
-                
+
+                syncTime_arr[0] = syncTime;
+ 
                 key = 1;
                 systemInited = true;
                 ROS_INFO("\033[1;32m Fast Odometry Initialized \033[0m");
@@ -310,25 +359,62 @@ class FastOdomGraph: public Params{
 
             computeLaserOdom();
             updateLaserFeatures();
+            publishClouds();
             resetClouds();
 
             integrateIMUData();
 
-            // add imu factor to graph
-            const gtsam::PreintegratedImuMeasurements& preint_imu = dynamic_cast<const gtsam::PreintegratedImuMeasurements&>(*imuIntegratorOpt_);
-            gtsam::ImuFactor imu_factor(X(key - 1), V(key - 1), X(key), V(key), B(key - 1), preint_imu);
-            graphFactors.add(imu_factor);
+            addIMUFactor();
+            addLiDARFactor();
 
-            // add imu bias between factor
-            graphFactors.add(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(B(key - 1), B(key), gtsam::imuBias::ConstantBias(),
-                             gtsam::noiseModel::Diagonal::Sigmas(sqrt(imuIntegratorOpt_->deltaTij()) * noiseModelBetweenBias)));
+            optimizeUpdateGraph();
+            getInitialOdom();
 
-            // add LiDAR factor
-            gtsam::Pose3 lidarPose = gtsam::Pose3(gtsam::Rot3::Quaternion(q_last_curr.w(), q_last_curr.x(), q_last_curr.y(), q_last_curr.z()), gtsam::Point3(t_last_curr.x(), t_last_curr.y(), t_last_curr.z()));
-            gtsam::Pose3 curPose = lidarPose.compose(lidar2Imu);
-            gtsam::BetweenFactor<gtsam::Pose3> pose_factor(X(key-1), X(key), curPose, correctionNoise);
-            graphFactors.add(pose_factor);
+            syncTime_arr[key] = syncTime;
+            ++key;
+            doneFirstOpt = true;
 
+            publishLaserOdom();
+
+            //frameCount++;
+        }
+
+        void getInitialOdom(){
+
+            double t_x = prevPose_.translation().x();             //t_w_curr.x(); //
+            double t_y = prevPose_.translation().y();             //t_w_curr.y(); //
+            double t_z = prevPose_.translation().z();             //t_w_curr.z(); //
+                                                                  
+            double q_w = prevPose_.rotation().toQuaternion().w(); //q_w_curr.w(); //
+            double q_x = prevPose_.rotation().toQuaternion().x(); //q_w_curr.x(); //
+            double q_y = prevPose_.rotation().toQuaternion().y(); //q_w_curr.y(); //
+            double q_z = prevPose_.rotation().toQuaternion().z(); //q_w_curr.z(); //
+            double roll, pitch, yaw;
+            tf::Quaternion orientation(q_x, q_y, q_z, q_w);
+            tf::Matrix3x3(orientation).getRPY(roll, pitch, yaw);
+
+            cloudInfo.initialGuessX = t_x;
+            cloudInfo.initialGuessY = t_y;
+            cloudInfo.initialGuessZ = t_z;
+            cloudInfo.initialGuessRoll  = roll;
+            cloudInfo.initialGuessPitch = pitch;
+            cloudInfo.initialGuessYaw   = yaw;
+
+            cloudInfo.odomAvailable = true;
+        }
+
+        void publishClouds(){
+
+            cloudInfo.header = cloudHeader;
+
+            cloudInfo.cloud_corner  = publishCloud(pub_cloudCornerLast,  laserCloudCornerLast,  cloudHeader.stamp, lidarFrame);
+            cloudInfo.cloud_surface = publishCloud(pub_cloudSurfLast, laserCloudSurfLast, cloudHeader.stamp, lidarFrame);
+            
+            // publish to mapOptimization
+            pubLaserCloudInfo.publish(cloudInfo);
+        }
+
+        void optimizeUpdateGraph(){
             // insert predicted values
             gtsam::NavState propState_ = imuIntegratorOpt_->predict(prevState_, prevBias_);
             graphValues.insert(X(key), propState_.pose());
@@ -348,14 +434,14 @@ class FastOdomGraph: public Params{
             prevState_ = gtsam::NavState(prevPose_, prevVel_);
             prevBias_  = result.at<gtsam::imuBias::ConstantBias>(B(key));
 
-            t_w_curr.x() = prevPose_.translation().x();
-            t_w_curr.y() = prevPose_.translation().y();
-            t_w_curr.z() = prevPose_.translation().z();
+            //t_w_curr.x() = prevPose_.translation().x();
+            //t_w_curr.y() = prevPose_.translation().y();
+            //t_w_curr.z() = prevPose_.translation().z();
 
-            q_w_curr.w() = prevPose_.rotation().toQuaternion().w();
-            q_w_curr.x() = prevPose_.rotation().toQuaternion().x();
-            q_w_curr.y() = prevPose_.rotation().toQuaternion().y();
-            q_w_curr.z() = prevPose_.rotation().toQuaternion().z();
+            //q_w_curr.w() = prevPose_.rotation().toQuaternion().w();
+            //q_w_curr.x() = prevPose_.rotation().toQuaternion().x();
+            //q_w_curr.y() = prevPose_.rotation().toQuaternion().y();
+            //q_w_curr.z() = prevPose_.rotation().toQuaternion().z();
 
             // Reset the optimization preintegration object.
             imuIntegratorOpt_->resetIntegrationAndSetBias(prevBias_);
@@ -388,13 +474,35 @@ class FastOdomGraph: public Params{
                 }
             }
 
-            ++key;
-            doneFirstOpt = true;
-
-            publishLaserOdom();
-
-            //frameCount++;
         }
+
+        void addLiDARFactor(){
+            // add LiDAR factor
+            gtsam::Pose3 lidarPose = gtsam::Pose3(gtsam::Rot3::Quaternion(q_last_curr.w(), q_last_curr.x(), q_last_curr.y(), q_last_curr.z()), gtsam::Point3(t_last_curr.x(), t_last_curr.y(), t_last_curr.z()));
+            gtsam::Pose3 curPose = lidarPose.compose(lidar2Imu);
+            gtsam::BetweenFactor<gtsam::Pose3> pose_factor(X(key-1), X(key), curPose, correctionNoise2);
+            graphFactors.add(pose_factor);
+
+            gtsam::Pose3 priorPose = gtsam::Pose3(gtsam::Rot3::Quaternion(q_w_curr.w(), q_w_curr.x(), q_w_curr.y(), q_w_curr.z()), gtsam::Point3(t_w_curr.x(), t_w_curr.y(), t_w_curr.z()));
+            curPose = priorPose.compose(lidar2Imu);
+            gtsam::PriorFactor<gtsam::Pose3> pose_factor_1(X(key), curPose, correctionNoise);
+            graphFactors.add(pose_factor_1);
+        }
+
+        void addIMUFactor(){
+            // add imu factor to graph
+            const gtsam::PreintegratedImuMeasurements& preint_imu = dynamic_cast<const gtsam::PreintegratedImuMeasurements&>(*imuIntegratorOpt_);
+            gtsam::ImuFactor imu_factor(X(key - 1), V(key - 1), X(key), V(key), B(key - 1), preint_imu);
+            graphFactors.add(imu_factor);
+
+            // add imu bias between factor
+            graphFactors.add(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(B(key - 1), B(key), gtsam::imuBias::ConstantBias(),
+                             gtsam::noiseModel::Diagonal::Sigmas(sqrt(imuIntegratorOpt_->deltaTij()) * noiseModelBetweenBias)));
+
+        }
+
+
+
         void resetGraph4Speed(){
             if (key == 100){
                 // get updated noise before reset
@@ -680,8 +788,8 @@ class FastOdomGraph: public Params{
 
             }
 
-            //t_w_curr = t_w_curr + q_w_curr * t_last_curr;
-            //q_w_curr = q_w_curr * q_last_curr;
+            t_w_curr = t_w_curr + q_w_curr * t_last_curr;
+            q_w_curr = q_w_curr * q_last_curr;
 
         }
 

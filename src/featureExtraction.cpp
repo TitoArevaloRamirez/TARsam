@@ -434,31 +434,31 @@ class FeatureExtraction: public Params{
             sensor_msgs::PointCloud2 laserCloudOutMsg;
             pcl::toROSMsg(*laserCloud, laserCloudOutMsg);
             laserCloudOutMsg.header.stamp = cloudHeader.stamp;
-            laserCloudOutMsg.header.frame_id = "camera_init";
+            laserCloudOutMsg.header.frame_id = "odom";
             pub_lidarCloud_projectDeskew .publish(laserCloudOutMsg);
 
             sensor_msgs::PointCloud2 cornerPointsSharpMsg;
             pcl::toROSMsg(cornerPointsSharp, cornerPointsSharpMsg);
             cornerPointsSharpMsg.header.stamp = cloudHeader.stamp;
-            cornerPointsSharpMsg.header.frame_id = "camera_init";
+            cornerPointsSharpMsg.header.frame_id = "odom";
             pub_cornerPointsSharp.publish(cornerPointsSharpMsg);
 
             sensor_msgs::PointCloud2 cornerPointsLessSharpMsg;
             pcl::toROSMsg(cornerPointsLessSharp, cornerPointsLessSharpMsg);
             cornerPointsLessSharpMsg.header.stamp = cloudHeader.stamp;
-            cornerPointsLessSharpMsg.header.frame_id = "camera_init";
+            cornerPointsLessSharpMsg.header.frame_id = "odom";
             pub_cornerPointsLessSharp.publish(cornerPointsLessSharpMsg);
 
             sensor_msgs::PointCloud2 surfPointsFlat2;
             pcl::toROSMsg(surfPointsFlat, surfPointsFlat2);
             surfPointsFlat2.header.stamp = cloudHeader.stamp;
-            surfPointsFlat2.header.frame_id = "camera_init";
+            surfPointsFlat2.header.frame_id = "odom";
             pub_surfacePointsFlat.publish(surfPointsFlat2);
 
             sensor_msgs::PointCloud2 surfPointsLessFlat2;
             pcl::toROSMsg(surfPointsLessFlat, surfPointsLessFlat2);
             surfPointsLessFlat2.header.stamp = cloudHeader.stamp;
-            surfPointsLessFlat2.header.frame_id = "camera_init";
+            surfPointsLessFlat2.header.frame_id = "odom";
             pub_surfacePointsLessFlat.publish(surfPointsLessFlat2);
         }
 

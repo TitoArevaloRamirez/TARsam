@@ -11,6 +11,7 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
   cv_bridge
+  tf
   #msgs
   std_msgs
   geometry_msgs
@@ -97,6 +98,13 @@ target_link_libraries(${PROJECT_NAME}_featureExtraction ${catkin_LIBRARIES} ${PC
 # Fast Odometry Graph 
 add_executable(${PROJECT_NAME}_fastOdomGraph src/fastOdomGraph.cpp)
 target_link_libraries(${PROJECT_NAME}_fastOdomGraph ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${CERES_LIBRARIES} gtsam)
+add_dependencies(${PROJECT_NAME}_fastOdomGraph ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
+
+# Mapping Optimization
+add_executable(${PROJECT_NAME}_mapOptimization src/mapOptimization.cpp)
+add_dependencies(${PROJECT_NAME}_mapOptimization ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
+target_compile_options(${PROJECT_NAME}_mapOptimization PRIVATE ${OpenMP_CXX_FLAGS})
+target_link_libraries(${PROJECT_NAME}_mapOptimization ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${OpenMP_CXX_FLAGS} gtsam)
 
 #############
 ## Install ##
